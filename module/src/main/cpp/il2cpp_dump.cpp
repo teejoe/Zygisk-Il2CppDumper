@@ -331,6 +331,8 @@ void il2cpp_api_init(void *handle) {
             il2cpp_base = reinterpret_cast<uint64_t>(dlInfo.dli_fbase);
         }
         LOGI("il2cpp_base: %" PRIx64"", il2cpp_base);
+        LOGI("il2cpp_object_new: %p", (void*)((uint64_t)il2cpp_object_new - (uint64_t)il2cpp_base));
+        LOGI("il2cpp_runtime_invoke: %p", (void*)((uint64_t)il2cpp_runtime_invoke - (uint64_t)il2cpp_base));
     } else {
         LOGE("Failed to initialize il2cpp api.");
         return;
@@ -416,8 +418,9 @@ void il2cpp_dump(const char *outDir) {
             }
         }
     }
-    LOGI("write dump file");
+
     auto outPath = std::string(outDir).append("/files/dump.cs");
+    LOGI("write dump file: %s", outPath.c_str());
     std::ofstream outStream(outPath);
     outStream << imageOutput.str();
     auto count = outPuts.size();
