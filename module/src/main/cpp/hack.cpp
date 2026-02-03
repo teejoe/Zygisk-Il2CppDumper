@@ -31,15 +31,208 @@
 #include <vector>
 #include <unordered_set>
 #include <map>
+#include <fstream>
 
 
-#define APK_ASSET_PATH "/data/app/~~iDUJ3_95Z5oxcRkX3Vt_Lg==/com.tencent.jkchess-96MHX-4aZzh9ZijtR3JHfA==/base.apk!assets/AssetBundles/Android"
-#define UNZIP_APK_ASSET_PATH "/data/data/com.tencent.jkchess/Android"
-#define INTERNAL_COS_PATH "/data/data/com.tencent.jkchess/files/COSABResource/Android"
-#define EXTERNAL_COS_PATH "/sdcard/Android/data/com.tencent.jkchess/files/COSABResource/Android"
-#define UPDATE_ASSET_PATH1 "/data/data/com.tencent.jkchess/files/VersionUpdate/AssetBundles/Android"
-#define UPDATE_ASSET_PATH2 "/sdcard/Android/data/com.tencent.jkchess/files/VersionUpdate/AssetBundles/Android"
-#define EXCLUDE_PATH "/data/data/com.tencent.jkchess/dump_exclude/"
+
+// 动态路径（运行时初始化）
+static std::string g_apk_path;                    // base.apk 路径
+static std::string g_apk_asset_path;              // base.apk!assets/AssetBundles/Android
+static std::string g_game_data_dir;               // /data/data/com.xxx
+static std::string g_internal_cos_path;           // /data/data/com.xxx/files/COSABResource/Android
+static std::string g_external_cos_path;           // /sdcard/Android/data/com.xxx/files/COSABResource/Android
+static std::string g_update_asset_path1;          // /data/data/com.xxx/files/VersionUpdate/AssetBundles/Android
+static std::string g_update_asset_path2;          // /sdcard/Android/data/com.xxx/files/VersionUpdate/AssetBundles/Android
+static std::string g_exclude_path;                // /data/data/com.xxx/dump_exclude/
+
+// 从 game_data_dir 提取包名
+std::string GetPackageName(const char* game_data_dir) {
+    std::string path(game_data_dir);
+    size_t pos = path.rfind('/');
+    if (pos != std::string::npos) {
+        return path.substr(pos + 1);
+    }
+    return path;
+}
+
+std::string GetApkPath() {
+    std::ifstream maps("/proc/self/maps");
+    std::string line;
+    while (std::getline(maps, line)) {
+        // 查找包含 base.apk 的行
+        if (line.find("base.apk") != std::string::npos) {
+            // 格式: address perms offset dev inode pathname
+            // 例如: 7f1234000-7f1235000 r--p 00000000 fd:00 12345 /data/app/.../base.apk
+            size_t pos = line.find('/');
+            if (pos != std::string::npos) {
+                std::string path = line.substr(pos);
+                // 移除可能的 "!classes.dex" 等后缀
+                size_t excl = path.find('!');
+                if (excl != std::string::npos) {
+                    path = path.substr(0, excl);
+                }
+                // 去除尾部空白
+                while (!path.empty() && (path.back() == ' ' || path.back() == '\n' || path.back() == '\r')) {
+                    path.pop_back();
+                }
+                return path;
+            }
+        }
+    }
+    return {};
+}
+
+// 初始化所有动态路径
+void InitPaths(const char* game_data_dir) {
+    if (!g_game_data_dir.empty()) return; // 已初始化
+    
+    g_game_data_dir = game_data_dir;
+    std::string package_name = GetPackageName(game_data_dir);
+    
+    // 获取 APK 路径
+    g_apk_path = GetApkPath();
+    if (!g_apk_path.empty()) {
+        g_apk_asset_path = g_apk_path + "!assets/AssetBundles/Android";
+        LOGD("APK asset path: %s", g_apk_asset_path.c_str());
+    } else {
+        LOGE("Failed to get APK path!");
+    }
+    
+    // 设置其他路径
+    g_internal_cos_path = std::string(game_data_dir) + "/files/COSABResource/Android";
+    g_external_cos_path = "/sdcard/Android/data/" + package_name + "/files/COSABResource/Android";
+    g_update_asset_path1 = std::string(game_data_dir) + "/files/VersionUpdate/AssetBundles/Android";
+    g_update_asset_path2 = "/sdcard/Android/data/" + package_name + "/files/VersionUpdate/AssetBundles/Android";
+    g_exclude_path = std::string(game_data_dir) + "/dump_exclude/";
+    
+    LOGD("Paths initialized:");
+    LOGD("  game_data_dir: %s", g_game_data_dir.c_str());
+    LOGD("  apk_path: %s", g_apk_path.c_str());
+    LOGD("  apk_asset_path: %s", g_apk_asset_path.c_str());
+    LOGD("  internal_cos_path: %s", g_internal_cos_path.c_str());
+    LOGD("  external_cos_path: %s", g_external_cos_path.c_str());
+    LOGD("  update_asset_path1: %s", g_update_asset_path1.c_str());
+    LOGD("  update_asset_path2: %s", g_update_asset_path2.c_str());
+    LOGD("  exclude_path: %s", g_exclude_path.c_str());
+}
+
+
+
+// ============== ZIP 文件结构定义 ==============
+#pragma pack(push, 1)
+struct ZipEndOfCentralDir {
+    uint32_t signature;        // 0x06054b50
+    uint16_t disk_number;
+    uint16_t cd_disk_number;
+    uint16_t cd_entries_disk;
+    uint16_t cd_entries_total;
+    uint32_t cd_size;
+    uint32_t cd_offset;
+    uint16_t comment_length;
+};
+
+struct ZipCentralDirHeader {
+    uint32_t signature;        // 0x02014b50
+    uint16_t version_made;
+    uint16_t version_needed;
+    uint16_t flags;
+    uint16_t compression;
+    uint16_t mod_time;
+    uint16_t mod_date;
+    uint32_t crc32;
+    uint32_t compressed_size;
+    uint32_t uncompressed_size;
+    uint16_t name_length;
+    uint16_t extra_length;
+    uint16_t comment_length;
+    uint16_t disk_start;
+    uint16_t internal_attrs;
+    uint32_t external_attrs;
+    uint32_t local_header_offset;
+};
+#pragma pack(pop)
+
+// 检查 APK 中是否存在指定的 asset 文件
+// apk_path: APK 文件路径
+// asset_name: 相对于 assets/ 的路径，例如 "AssetBundles/Android/xx/xxx.unity3d"
+bool assetExistsInApk(const char* apk_path, const char* asset_name) {
+    FILE* fp = fopen(apk_path, "rb");
+    if (!fp) {
+        LOGD("Failed to open apk file: %s", apk_path);
+        return false;
+    }
+    
+    // 获取文件大小
+    fseek(fp, 0, SEEK_END);
+    long file_size = ftell(fp);
+    
+    // 查找 End of Central Directory (从文件末尾向前搜索)
+    ZipEndOfCentralDir eocd;
+    bool found = false;
+    for (long offset = sizeof(ZipEndOfCentralDir); offset < 65535 + sizeof(ZipEndOfCentralDir) && offset <= file_size; offset++) {
+        fseek(fp, file_size - offset, SEEK_SET);
+        if (fread(&eocd, sizeof(eocd), 1, fp) != 1) break;
+        if (eocd.signature == 0x06054b50) {
+            found = true;
+            break;
+        }
+    }
+    
+    if (!found) {
+        fclose(fp);
+        LOGD("EOCD signature not found in: %s", apk_path);
+        return false;
+    }
+    
+    // 构建要查找的完整路径
+    char full_name[512];
+    snprintf(full_name, sizeof(full_name), "assets/%s", asset_name);
+    size_t target_len = strlen(full_name);
+    
+    // 读取中央目录
+    fseek(fp, eocd.cd_offset, SEEK_SET);
+    
+    char name_buf[512];
+    for (uint16_t i = 0; i < eocd.cd_entries_total; i++) {
+        ZipCentralDirHeader cdh;
+        if (fread(&cdh, sizeof(cdh), 1, fp) != 1) break;
+        if (cdh.signature != 0x02014b50) break;
+        
+        uint16_t name_len = cdh.name_length;
+        if (name_len < sizeof(name_buf)) {
+            if (fread(name_buf, name_len, 1, fp) != 1) break;
+            name_buf[name_len] = '\0';
+            
+            if (name_len == target_len && strcmp(name_buf, full_name) == 0) {
+                fclose(fp);
+                return true;
+            }
+        } else {
+            fseek(fp, name_len, SEEK_CUR);
+        }
+        
+        // 跳过 extra 和 comment
+        fseek(fp, cdh.extra_length + cdh.comment_length, SEEK_CUR);
+    }
+    
+    fclose(fp);
+    return false;
+}
+
+// 检查 APK 中是否存在指定的 asset 文件（自动获取 APK 路径版本）
+bool assetExistsInApk(const char* asset_name) {
+    static std::string apk_path;
+    if (apk_path.empty()) {
+        apk_path = GetApkPath();
+        if (apk_path.empty()) {
+            LOGD("Failed to get APK path");
+            return false;
+        }
+        LOGD("APK path: %s", apk_path.c_str());
+    }
+    return assetExistsInApk(apk_path.c_str(), asset_name);
+}
+
 
 typedef int (*shadowhook_init_func)(int mode, bool debuggable);
 typedef void* (*shadowhook_hook_sym_name_func)(const char *lib_name, const char *sym_name, void *new_addr, void **orig_addr);
@@ -208,7 +401,7 @@ void list_files_recursive(const char *base_path, int depth) {
                 continue;
             }
             char exclude[256] = { 0 };
-            sprintf(exclude, "%s/%s", EXCLUDE_PATH, dp->d_name);
+            sprintf(exclude, "%s%s", g_exclude_path.c_str(), dp->d_name);
             if (exists(exclude)) {
                 LOGD("skip exclude: %s", dp->d_name);
                 continue;
@@ -222,7 +415,7 @@ void list_files_recursive(const char *base_path, int depth) {
             }
             char asset_path[1024] = { 0 };
             sprintf(asset_path, "%s/%c%c/%s",
-                    APK_ASSET_PATH,
+                    g_apk_asset_path.c_str(),
                     dp->d_name[0], dp->d_name[1], dp->d_name);
 
             //sprintf(asset_path, "/data/app/~~iDUJ3_95Z5oxcRkX3Vt_Lg==/com.tencent.jkchess-96MHX-4aZzh9ZijtR3JHfA==/base.apk!assets/AssetBundles/Android/%s",
@@ -235,30 +428,36 @@ void list_files_recursive(const char *base_path, int depth) {
 }
 
 bool get_asset_path(const char* tkhash, char* path) {
-    sprintf(path, "%s/%c%c/%s.unity3d", UPDATE_ASSET_PATH1, tkhash[0], tkhash[1], tkhash);
+    // 检查更新路径1
+    sprintf(path, "%s/%c%c/%s.unity3d", g_update_asset_path1.c_str(), tkhash[0], tkhash[1], tkhash);
     LOGD("path: %s", path);
     if (exists(path)) {
         return true;
     }
 
-    sprintf(path, "%s/%c%c/%s.unity3d", UPDATE_ASSET_PATH2, tkhash[0], tkhash[1], tkhash);
+    // 检查更新路径2
+    sprintf(path, "%s/%c%c/%s.unity3d", g_update_asset_path2.c_str(), tkhash[0], tkhash[1], tkhash);
     if (exists(path)) {
         return true;
     }
 
-    sprintf(path, "%s/%c%c/%s.cos", EXTERNAL_COS_PATH, tkhash[0], tkhash[1], tkhash);
+    // 检查外部COS路径
+    sprintf(path, "%s/%c%c/%s.cos", g_external_cos_path.c_str(), tkhash[0], tkhash[1], tkhash);
     if (exists(path)) {
         return true;
     }
 
-    sprintf(path, "%s/%c%c/%s.cos", INTERNAL_COS_PATH, tkhash[0], tkhash[1], tkhash);
+    // 检查内部COS路径
+    sprintf(path, "%s/%c%c/%s.cos", g_internal_cos_path.c_str(), tkhash[0], tkhash[1], tkhash);
     if (exists(path)) {
         return true;
     }
-    
-    sprintf(path, "%s/%c%c/%s.unity3d", UNZIP_APK_ASSET_PATH, tkhash[0], tkhash[1], tkhash);
-    if (exists(path)) {
-        sprintf(path, "%s/%c%c/%s.unity3d", APK_ASSET_PATH, tkhash[0], tkhash[1], tkhash);
+
+    // 检查APK中是否存在该asset
+    char asset_in_apk[256];
+    sprintf(asset_in_apk, "AssetBundles/Android/%c%c/%s.unity3d", tkhash[0], tkhash[1], tkhash);
+    if (!g_apk_path.empty() && assetExistsInApk(g_apk_path.c_str(), asset_in_apk)) {
+        sprintf(path, "%s/%c%c/%s.unity3d", g_apk_asset_path.c_str(), tkhash[0], tkhash[1], tkhash);
         return true;
     }
 
@@ -290,6 +489,9 @@ void log_hook_error() {
 }
 
 void dump_start(const char *game_data_dir) {
+    // 初始化动态路径
+    InitPaths(game_data_dir);
+    
     char path[256] = { 0 };
     sprintf(path, "%s/dumpasset", game_data_dir);
     while (true) {
@@ -403,7 +605,16 @@ void hack_start(const char *game_data_dir) {
 
 std::string GetLibDir(JavaVM *vms) {
     JNIEnv *env = nullptr;
-    vms->AttachCurrentThread(&env, nullptr);
+    jint result = vms->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+    if (result == JNI_EDETACHED) {
+        if (vms->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+            LOGE("AttachCurrentThread failed");
+            return {};
+        }
+    } else if (result != JNI_OK || env == nullptr) {
+        LOGE("GetEnv failed: %d", result);
+        return {};
+    }
     jclass activity_thread_clz = env->FindClass("android/app/ActivityThread");
     if (activity_thread_clz != nullptr) {
         jmethodID currentApplicationId = env->GetStaticMethodID(activity_thread_clz,
