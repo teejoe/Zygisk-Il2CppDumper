@@ -311,19 +311,29 @@ void load_all_textures(const char* path) {
     std::string uri;
     std::vector<std::string> textures;
     get_asset_info(path, uri, textures, 10000);
-    LOGD("uri: %s, count=%zu", uri.c_str(), textures.size());
+    size_t total = textures.size();
+    LOGD("uri: %s, total=%zu", uri.c_str(), total);
+    size_t current = 0;
     for (auto &texture : textures) {
-        LOGD("load texture: %s", texture.c_str());
+        current++;
+        LOGD("load texture [%zu/%zu]: %s", current, total, texture.c_str());
         set_property("dumpasset.name", texture.c_str());
         load_texture_safe(path, uri, texture.c_str());
+        int wait_count = 0;
         while (true) {
+            wait_count++;
             usleep(1000);
-            if (get_property("dumpasset.name.done") == texture) {
+            if (get_property("dumpasset.name.done") == texture || wait_count > 1500) { // 1.5 seconds
                 set_property("dumpasset.name.done", "");
                 break;
             }
         }
+        if (get_property("dumpasset.stop") == "1") {
+            set_property("dumpasset.stop", "");
+            break;
+        }
     }
+    LOGD("load all texture done [%zu/%zu]: %s", current, total, uri.c_str());
 }
 
 void dump_asset(const char* path) {
@@ -430,7 +440,6 @@ void list_files_recursive(const char *base_path, int depth) {
 bool get_asset_path(const char* tkhash, char* path) {
     // 检查更新路径1
     sprintf(path, "%s/%c%c/%s.unity3d", g_update_asset_path1.c_str(), tkhash[0], tkhash[1], tkhash);
-    LOGD("path: %s", path);
     if (exists(path)) {
         return true;
     }
@@ -543,10 +552,11 @@ void dump_start(const char *game_data_dir) {
 
 
     get_asset_info = (get_asset_info_func)dlsym(handle, "get_AssetBundle_Texture2D_info");
+
     load_asset = (load_asset_func)dlsym(handle, "load_AssetBundle_Texture2D");
     get_loaded_assets = (get_loaded_assets_func) dlsym(handle, "loadedhase");
     get_TKHash128 = (get_TKHash128_func) dlsym(handle, "get_TKHash128");
-    LOGD("get_AssetBundle_Texture2D_info: %p, load_AssetBundle_Texture2D %p, loadedhase %p, get_TKHash128: %p",
+    LOGD("get_AssetBundle_Texture2D_info:%p, load_AssetBundle_Texture2D %p, loadedhase %p, get_TKHash128: %p",
          get_asset_info, load_asset, get_loaded_assets, get_TKHash128);
     sleep(1);
     count = 0;
