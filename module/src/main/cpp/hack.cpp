@@ -152,6 +152,41 @@ struct ZipCentralDirHeader {
 };
 #pragma pack(pop)
 
+// ============== 全局状态与工具函数（需在 dump_apk_asset_bundles 之前定义） ==============
+static std::unordered_set<std::string> blacklist = {
+        "68fa3c8bb44a88b9acc746a7cc42d57d.unity3d",
+        "680644370ebb0d89232ca4993f1bd95d.unity3d",
+        "b9029a61afe8de3f0438bfe2b90b9858.unity3d",
+        "532349f1b103bfeb1453f1e5323d06fe.unity3d",
+        "53edec228724f1a5b99f47007258c25e.unity3d",
+        "8536a79bab433a687f8802fd8e1e13cd.unity3d"
+};
+static int count = 0;
+static std::map<std::string, std::string> loaded_assets;
+static std::unordered_set<std::string> loaded_assets_uri;
+
+void get_hash_by_name(const char *filename, char* hash) {
+    const char *dot = strrchr(filename, '.');
+
+    size_t hash_length = dot - filename;
+
+    if (hash_length > 0 && hash_length <= 128) {
+        strncpy(hash, filename, hash_length);
+        hash[hash_length] = '\0';  // 确保以null结尾
+    } else {
+        strcpy(hash, filename);
+    }
+}
+
+bool exists(const char *path) {
+    if (access(path, F_OK) == 0) {
+        return true;
+    }
+    return false;
+}
+
+void dump_asset(const char* path);  // 前向声明
+
 // 检查 APK 中是否存在指定的 asset 文件
 // apk_path: APK 文件路径
 // asset_name: 相对于 assets/ 的路径，例如 "AssetBundles/Android/xx/xxx.unity3d"
@@ -219,6 +254,128 @@ bool assetExistsInApk(const char* apk_path, const char* asset_name) {
     return false;
 }
 
+// 遍历 APK 中 assets/AssetBundles/Android 下所有 .unity3d 文件，对每个执行 dump_asset
+void dump_apk_asset_bundles() {
+    if (g_apk_path.empty()) {
+        LOGE("APK path not initialized, cannot dump asset bundles");
+        return;
+    }
+
+    FILE* fp = fopen(g_apk_path.c_str(), "rb");
+    if (!fp) {
+        LOGE("Failed to open apk file: %s", g_apk_path.c_str());
+        return;
+    }
+
+    // 获取文件大小
+    fseek(fp, 0, SEEK_END);
+    long file_size = ftell(fp);
+
+    // 查找 End of Central Directory
+    ZipEndOfCentralDir eocd;
+    bool found = false;
+    for (long offset = sizeof(ZipEndOfCentralDir); offset < 65535 + sizeof(ZipEndOfCentralDir) && offset <= file_size; offset++) {
+        fseek(fp, file_size - offset, SEEK_SET);
+        if (fread(&eocd, sizeof(eocd), 1, fp) != 1) break;
+        if (eocd.signature == 0x06054b50) {
+            found = true;
+            break;
+        }
+    }
+
+    if (!found) {
+        fclose(fp);
+        LOGE("EOCD signature not found in: %s", g_apk_path.c_str());
+        return;
+    }
+
+    const char* prefix = "assets/AssetBundles/Android/";
+    size_t prefix_len = strlen(prefix);
+    const char* suffix = ".unity3d";
+    size_t suffix_len = strlen(suffix);
+
+    // 读取中央目录，收集所有匹配的 asset 文件
+    std::vector<std::string> asset_files;
+    fseek(fp, eocd.cd_offset, SEEK_SET);
+
+    char name_buf[512];
+    for (uint16_t i = 0; i < eocd.cd_entries_total; i++) {
+        ZipCentralDirHeader cdh;
+        if (fread(&cdh, sizeof(cdh), 1, fp) != 1) break;
+        if (cdh.signature != 0x02014b50) break;
+
+        uint16_t name_len = cdh.name_length;
+        if (name_len < sizeof(name_buf)) {
+            if (fread(name_buf, name_len, 1, fp) != 1) break;
+            name_buf[name_len] = '\0';
+
+            // 检查前缀和后缀
+            if (name_len > prefix_len + suffix_len &&
+                strncmp(name_buf, prefix, prefix_len) == 0 &&
+                strncmp(name_buf + name_len - suffix_len, suffix, suffix_len) == 0) {
+
+                // 提取文件名部分（不含目录前缀 "assets/"）
+                // name_buf 格式: "assets/AssetBundles/Android/xx/xxxx.unity3d"
+                // asset_relative: "AssetBundles/Android/xx/xxxx.unity3d"
+                const char* asset_relative = name_buf + strlen("assets/");
+                std::string asset_name_str(asset_relative);
+
+                // 提取文件名（最后一段）
+                const char* filename = strrchr(name_buf, '/');
+                filename = filename ? filename + 1 : name_buf;
+
+                // 跳过黑名单
+                if (blacklist.find(filename) != blacklist.end()) {
+                    LOGD("skip blacklist: %s", filename);
+                    fseek(fp, cdh.extra_length + cdh.comment_length, SEEK_CUR);
+                    continue;
+                }
+
+                // 跳过 exclude 文件
+                char exclude[256] = { 0 };
+                sprintf(exclude, "%s%s", g_exclude_path.c_str(), filename);
+                if (exists(exclude)) {
+                    LOGD("skip exclude: %s", filename);
+                    fseek(fp, cdh.extra_length + cdh.comment_length, SEEK_CUR);
+                    continue;
+                }
+
+                // 跳过已加载的
+                char hash[128] = { 0 };
+                get_hash_by_name(filename, hash);
+                if (loaded_assets.find(hash) != loaded_assets.end()) {
+                    LOGD("skip loaded: %s", filename);
+                    fseek(fp, cdh.extra_length + cdh.comment_length, SEEK_CUR);
+                    continue;
+                }
+
+                asset_files.push_back(asset_name_str);
+            }
+        } else {
+            fseek(fp, name_len, SEEK_CUR);
+        }
+
+        // 跳过 extra 和 comment
+        fseek(fp, cdh.extra_length + cdh.comment_length, SEEK_CUR);
+    }
+
+    fclose(fp);
+
+    LOGD("Found %zu .unity3d files in APK assets/AssetBundles/Android", asset_files.size());
+
+    // 对每个文件执行 dump_asset
+    for (size_t idx = 0; idx < asset_files.size(); idx++) {
+        const std::string& asset_name = asset_files[idx];
+        // 构建路径格式: apk_path!assets/AssetBundles/Android/xx/xxx.unity3d
+        char asset_path[1024] = { 0 };
+        snprintf(asset_path, sizeof(asset_path), "%s!assets/%s", g_apk_path.c_str(), asset_name.c_str());
+        LOGD("dump_apk_asset [%zu/%zu]: %s", idx + 1, asset_files.size(), asset_path);
+        dump_asset(asset_path);
+    }
+
+    LOGD("dump_apk_asset_bundles done, total: %zu", asset_files.size());
+}
+
 // 检查 APK 中是否存在指定的 asset 文件（自动获取 APK 路径版本）
 bool assetExistsInApk(const char* asset_name) {
     static std::string apk_path;
@@ -264,18 +421,6 @@ static void my_glCompressedTexImage2D(int target, int level, int internalformat,
     LOGD("glCompressedTexImage2D: format=0x%x, w=%d, h=%d, size=%d", internalformat, width, height, imageSize);
     origin_glCompressedTexImage2D(target, level, internalformat, width, height, border, imageSize, data);
 }
-
-static std::unordered_set<std::string> blacklist = {
-        "68fa3c8bb44a88b9acc746a7cc42d57d.unity3d",
-        "680644370ebb0d89232ca4993f1bd95d.unity3d",
-        "b9029a61afe8de3f0438bfe2b90b9858.unity3d",
-        "532349f1b103bfeb1453f1e5323d06fe.unity3d",
-        "53edec228724f1a5b99f47007258c25e.unity3d",
-        "8536a79bab433a687f8802fd8e1e13cd.unity3d"
-};
-static int count = 0;
-static std::map<std::string, std::string> loaded_assets;
-static std::unordered_set<std::string> loaded_assets_uri;
 
 static void set_property(const char* name, const char* value) {
     __system_property_set(name, value);
@@ -350,26 +495,6 @@ void dump_asset(const char* path) {
             load_texture_safe(path, uri, texture.c_str());
         }
     }
-}
-
-void get_hash_by_name(const char *filename, char* hash) {
-    const char *dot = strrchr(filename, '.');
-
-    size_t hash_length = dot - filename;
-
-    if (hash_length > 0 && hash_length <= 128) {
-        strncpy(hash, filename, hash_length);
-        hash[hash_length] = '\0';  // 确保以null结尾
-    } else {
-        strcpy(hash, filename);
-    }
-}
-
-bool exists(const char *path) {
-    if (access(path, F_OK) == 0) {
-        return true;
-    }
-    return false;
 }
 
 // 递归获取目录下所有文件名
@@ -574,13 +699,33 @@ void dump_start(const char *game_data_dir) {
     //dump_by_uri("art_tft_raw/model_res/hero/set1/texture/h_lulu/lv1/materials/textures.unity3d");
     //dump_asset("/data/data/com.tencent.jkchess/files/COSABResource/Android/08/08907d46abe7d1424ef87589d7efd77d.cos");
 
-    LOGD("m2x waiting for prop: jkchess.dump_uri ...");
+    LOGD("m2x waiting for prop: jkchess.dump_uri / jkchess.dump_all ...");
     while (true) {
         usleep(100000);
         auto prop = get_property("jkchess.dump_uri");
         if (prop != "") {
-            dump_by_uri(prop.c_str());
+            // 从文件读取 URI（属性仅作为信号，避免 prop 长度限制）
+            char uri_file[512] = {0};
+            snprintf(uri_file, sizeof(uri_file), "%s/dump_uri.txt", game_data_dir);
+            char uri[512] = {0};
+            FILE* f = fopen(uri_file, "r");
+            if (f) {
+                fgets(uri, sizeof(uri), f);
+                // 去除末尾换行符
+                uri[strcspn(uri, "\r\n")] = '\0';
+                fclose(f);
+            }
+            if (uri[0] != '\0') {
+                dump_by_uri(uri);
+            } else {
+                LOGD("jkchess.dump_uri signal received but uri file is empty or missing: %s", uri_file);
+            }
             set_property("jkchess.dump_uri", "");
+        }
+        auto dump_all_prop = get_property("jkchess.dump_all");
+        if (dump_all_prop == "1") {
+            set_property("jkchess.dump_all", "");
+            dump_apk_asset_bundles();
         }
     }
 }
