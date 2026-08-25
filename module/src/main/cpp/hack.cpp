@@ -187,6 +187,37 @@ bool exists(const char *path) {
 
 void dump_asset(const char* path);  // 前向声明
 
+// 校验 APK 内 .unity3d 条目是否为合法 bundle:
+// 1. 路径必须形如 assets/AssetBundles/Android/xx/xxx.unity3d(平铺在 Android/ 下的是构建垃圾文件)
+// 2. 数据头 4 字节必须是 "FBAU"(游戏自定义 bundle 魔数,非标准 UnityFS)
+// 非法条目交给 Unity 加载会报 "Unable to read header",异步加载永不完成导致轮询死等
+// magic_out 带出实际读到的 4 字节数据头,供调用方日志展示
+bool isValidBundleEntry(FILE* fp, const ZipCentralDirHeader& cdh, const char* name_in_apk, unsigned char magic_out[4]) {
+    long save_pos = ftell(fp);
+    fseek(fp, cdh.local_header_offset, SEEK_SET);
+    unsigned char lh[30];
+    bool magic_read = false;
+    if (fread(lh, 1, sizeof(lh), fp) == sizeof(lh)) {
+        uint16_t name_len = (uint16_t)(lh[26] | (lh[27] << 8));
+        uint16_t extra_len = (uint16_t)(lh[28] | (lh[29] << 8));
+        // 当前位置已在本地头(30字节)之后,只需再跳过 name + extra 即到数据起始
+        if (fseek(fp, name_len + extra_len, SEEK_CUR) == 0) {
+            magic_read = (fread(magic_out, 1, 4, fp) == 4);
+        }
+    }
+    fseek(fp, save_pos, SEEK_SET);
+    if (!magic_read) {
+        return false;
+    }
+
+    const char* rel = name_in_apk + strlen("assets/AssetBundles/Android/");
+    const char* slash = strchr(rel, '/');
+    if (!slash || slash - rel != 2) {
+        return false;
+    }
+    return memcmp(magic_out, "FBAU", 4) == 0;
+}
+
 // 检查 APK 中是否存在指定的 asset 文件
 // apk_path: APK 文件路径
 // asset_name: 相对于 assets/ 的路径，例如 "AssetBundles/Android/xx/xxx.unity3d"
@@ -324,6 +355,15 @@ void dump_apk_asset_bundles() {
                 const char* filename = strrchr(name_buf, '/');
                 filename = filename ? filename + 1 : name_buf;
 
+                // 跳过非法 bundle 条目
+                unsigned char entry_magic[4] = {0};
+                if (!isValidBundleEntry(fp, cdh, name_buf, entry_magic)) {
+                    LOGD("skip invalid bundle entry: %s, header=%02x%02x%02x%02x", name_buf,
+                         entry_magic[0], entry_magic[1], entry_magic[2], entry_magic[3]);
+                    fseek(fp, cdh.extra_length + cdh.comment_length, SEEK_CUR);
+                    continue;
+                }
+
                 // 跳过黑名单
                 if (blacklist.find(filename) != blacklist.end()) {
                     LOGD("skip blacklist: %s", filename);
@@ -409,6 +449,248 @@ shadowhook_init_func shadowhook_init = nullptr;
 shadowhook_hook_sym_name_func shadowhook_hook_sym_name = nullptr;
 shadowhook_get_errno_func shadowhook_get_errno = nullptr;
 shadowhook_to_errmsg_func shadowhook_to_errmsg = nullptr;
+
+// 枚举条目:load_path 供 Unity 加载,out_name 写入结果文件第二列
+struct EnumEntry {
+    int priority;
+    std::string load_path;
+    std::string out_name;
+};
+
+// 递归收集目录下指定后缀的 bundle 文件,按文件名 hash 去重插入 entries(prio 小者优先)
+// 校验数据头 FBAU 魔数,跳过黑名单与垃圾文件
+static void collect_fs_assets(const std::string& base, const char* suffix, int prio, std::map<std::string, EnumEntry>& entries) {
+    DIR* dir = opendir(base.c_str());
+    if (!dir) {
+        return;
+    }
+    struct dirent* dp;
+    while ((dp = readdir(dir)) != nullptr) {
+        if (strcmp(dp->d_name, ".") == 0 || strcmp(dp->d_name, "..") == 0) {
+            continue;
+        }
+        std::string path = base + "/" + dp->d_name;
+        struct stat st;
+        if (stat(path.c_str(), &st) != 0) {
+            continue;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            collect_fs_assets(path, suffix, prio, entries);
+            continue;
+        }
+        const char* dot = strrchr(dp->d_name, '.');
+        if (!dot || strcmp(dot, suffix) != 0) {
+            continue;
+        }
+        if (blacklist.find(dp->d_name) != blacklist.end()) {
+            LOGD("skip blacklist: %s", dp->d_name);
+            continue;
+        }
+        FILE* mf = fopen(path.c_str(), "rb");
+        if (!mf) {
+            continue;
+        }
+        char magic[4] = { 0 };
+        bool is_fbau = (fread(magic, 1, 4, mf) == 4 && memcmp(magic, "FBAU", 4) == 0);
+        fclose(mf);
+        if (!is_fbau) {
+            LOGD("skip non-FBAU: %s", path.c_str());
+            continue;
+        }
+        char hash[128] = { 0 };
+        get_hash_by_name(dp->d_name, hash);
+        auto it = entries.find(hash);
+        if (it == entries.end() || prio < it->second.priority) {
+            EnumEntry e;
+            e.priority = prio;
+            e.load_path = path;
+            e.out_name = path;
+            entries[hash] = e;
+        }
+    }
+    closedir(dir);
+}
+
+// 枚举 APK 与热更/COS 目录中所有 bundle 资源,只输出含 Texture2D 资源的条目,写入 files/dump_uri_all.txt
+// 行格式: uri\tAssetBundles/Android/xx/xxx.unity3d\ttex1,tex2,...
+// 只跳过黑名单与非法条目;已在 loaded_assets 中的以已知 uri 作为加载提示加速内存命中
+void enumerate_apk_asset_uris(const char* game_data_dir) {
+    if (g_apk_path.empty()) {
+        LOGE("APK path not initialized, cannot enumerate asset bundles");
+        return;
+    }
+
+    FILE* fp = fopen(g_apk_path.c_str(), "rb");
+    if (!fp) {
+        LOGE("Failed to open apk file: %s", g_apk_path.c_str());
+        return;
+    }
+
+    fseek(fp, 0, SEEK_END);
+    long file_size = ftell(fp);
+
+    // 查找 End of Central Directory
+    ZipEndOfCentralDir eocd;
+    bool found = false;
+    for (long offset = sizeof(ZipEndOfCentralDir); offset < 65535 + sizeof(ZipEndOfCentralDir) && offset <= file_size; offset++) {
+        fseek(fp, file_size - offset, SEEK_SET);
+        if (fread(&eocd, sizeof(eocd), 1, fp) != 1) break;
+        if (eocd.signature == 0x06054b50) {
+            found = true;
+            break;
+        }
+    }
+
+    if (!found) {
+        fclose(fp);
+        LOGE("EOCD signature not found in: %s", g_apk_path.c_str());
+        return;
+    }
+
+    const char* prefix = "assets/AssetBundles/Android/";
+    size_t prefix_len = strlen(prefix);
+    const char* suffix = ".unity3d";
+    size_t suffix_len = strlen(suffix);
+
+    std::vector<std::string> asset_files;
+    fseek(fp, eocd.cd_offset, SEEK_SET);
+
+    char name_buf[512];
+    for (uint16_t i = 0; i < eocd.cd_entries_total; i++) {
+        ZipCentralDirHeader cdh;
+        if (fread(&cdh, sizeof(cdh), 1, fp) != 1) break;
+        if (cdh.signature != 0x02014b50) break;
+
+        uint16_t name_len = cdh.name_length;
+        if (name_len < sizeof(name_buf)) {
+            if (fread(name_buf, name_len, 1, fp) != 1) break;
+            name_buf[name_len] = '\0';
+
+            if (name_len > prefix_len + suffix_len &&
+                strncmp(name_buf, prefix, prefix_len) == 0 &&
+                strncmp(name_buf + name_len - suffix_len, suffix, suffix_len) == 0) {
+
+                const char* filename = strrchr(name_buf, '/');
+                filename = filename ? filename + 1 : name_buf;
+                unsigned char entry_magic[4] = {0};
+                if (!isValidBundleEntry(fp, cdh, name_buf, entry_magic)) {
+                    LOGD("skip invalid bundle entry: %s, header=%02x%02x%02x%02x", name_buf,
+                         entry_magic[0], entry_magic[1], entry_magic[2], entry_magic[3]);
+                } else if (blacklist.find(filename) != blacklist.end()) {
+                    LOGD("skip blacklist: %s", filename);
+                } else {
+                    // "AssetBundles/Android/xx/xxx.unity3d"
+                    asset_files.push_back(std::string(name_buf + strlen("assets/")));
+                }
+            }
+        } else {
+            fseek(fp, name_len, SEEK_CUR);
+        }
+
+        fseek(fp, cdh.extra_length + cdh.comment_length, SEEK_CUR);
+    }
+
+    fclose(fp);
+
+    LOGD("Found %zu .unity3d files in APK assets/AssetBundles/Android", asset_files.size());
+
+    // 跨存储位置去重:同一资源的文件名 hash 相同,热更/COS 版本覆盖 APK 版本
+    // priority 与 get_asset_path 一致: 1=内部热更 2=外部热更 3=外部COS 4=内部COS 5=APK
+    std::map<std::string, EnumEntry> entries;
+    for (size_t i = 0; i < asset_files.size(); i++) {
+        const std::string& rel = asset_files[i];
+        const char* filename = strrchr(rel.c_str(), '/');
+        filename = filename ? filename + 1 : rel.c_str();
+        char hash[128] = { 0 };
+        get_hash_by_name(filename, hash);
+        EnumEntry e;
+        e.priority = 5;
+        e.load_path = g_apk_path + "!assets/" + rel;
+        e.out_name = rel;
+        entries[hash] = e;
+    }
+    collect_fs_assets(g_update_asset_path1, ".unity3d", 1, entries);
+    collect_fs_assets(g_update_asset_path2, ".unity3d", 2, entries);
+    collect_fs_assets(g_external_cos_path, ".cos", 3, entries);
+    collect_fs_assets(g_internal_cos_path, ".cos", 4, entries);
+    LOGD("total unique bundles after dedup: %zu (APK %zu + fs)", entries.size(), asset_files.size());
+
+    char out_path[512] = { 0 };
+    snprintf(out_path, sizeof(out_path), "%s/files/dump_uri_all.txt", game_data_dir);
+
+    // 断点续跑:dump 线程与 Unity 主线程竞争偶发崩溃会杀死进程,重启后跳过已写入条目继续
+    // 行格式: uri\tAssetBundles/Android/xx/xxx.unity3d\ttex1,tex2,...(旧格式无第三列)
+    // 检测到旧格式行则整个文件作废(改名 .old),从零重跑,避免旧数据导致全量跳过
+    std::unordered_set<std::string> done;
+    FILE* prev = fopen(out_path, "r");
+    if (prev) {
+        char line[65536];
+        bool stale = false;
+        while (fgets(line, sizeof(line), prev)) {
+            char* tab = strchr(line, '\t');
+            if (!tab) continue;
+            char* end = strchr(tab + 1, '\t');
+            if (!end) {
+                stale = true;
+                break;
+            }
+            *end = '\0';
+            done.insert(std::string(tab + 1));
+        }
+        fclose(prev);
+        if (stale) {
+            done.clear();
+            char old_path[600] = { 0 };
+            snprintf(old_path, sizeof(old_path), "%s.old", out_path);
+            rename(out_path, old_path);
+            LOGD("stale format file renamed to %s, starting fresh", old_path);
+        }
+    }
+    if (!done.empty()) {
+        LOGD("resume: %zu entries already in %s", done.size(), out_path);
+    }
+
+    FILE* out = fopen(out_path, "a");
+    if (!out) {
+        LOGE("Failed to open output file: %s", out_path);
+        return;
+    }
+
+    size_t idx = 0;
+    for (auto& kv : entries) {
+        idx++;
+        const EnumEntry& e = kv.second;
+        if (done.find(e.out_name) != done.end()) {
+            continue;
+        }
+
+        // 文件名 hash 已在 loaded_assets 中则以已知 uri 作为提示,my_LoadAssetBundle 直接命中内存 bundle 免加载
+        std::string uri;
+        auto it = loaded_assets.find(kv.first);
+        if (it != loaded_assets.end()) {
+            uri = it->second;
+        }
+        std::vector<std::string> textures;
+        get_asset_info(e.load_path.c_str(), uri, textures, 10000);
+        LOGD("enumerate [%zu/%zu]: uri=%s, textures=%zu, from=%s", idx, entries.size(), uri.c_str(), textures.size(), e.load_path.c_str());
+
+        // 无 Texture2D 资源的 bundle 不写入;不写入则不进 done 集合,续跑时会重新检查(结果相同,仅多一次加载)
+        if (textures.empty()) {
+            continue;
+        }
+
+        std::string tex_list;
+        for (size_t t = 0; t < textures.size(); t++) {
+            if (t) tex_list += ",";
+            tex_list += textures[t];
+        }
+        fprintf(out, "%s\t%s\t%s\n", uri.c_str(), e.out_name.c_str(), tex_list.c_str());
+        fflush(out);
+    }
+
+    fclose(out);
+    LOGD("enumerate_apk_asset_uris done, total: %zu, output: %s", asset_files.size(), out_path);
+}
 
 static void (*origin_glCompressedTexSubImage2D)(long, long, long, long, long, long, long, long, const void* data);
 static void my_glCompressedTexSubImage2D(long target, long level, long x, long y, long width, long height, long format, long imageSize, const void* data ) {
@@ -699,7 +981,7 @@ void dump_start(const char *game_data_dir) {
     //dump_by_uri("art_tft_raw/model_res/hero/set1/texture/h_lulu/lv1/materials/textures.unity3d");
     //dump_asset("/data/data/com.tencent.jkchess/files/COSABResource/Android/08/08907d46abe7d1424ef87589d7efd77d.cos");
 
-    LOGD("m2x waiting for prop: jkchess.dump_uri / jkchess.dump_all ...");
+    LOGD("m2x waiting for prop: jkchess.dump_uri / jkchess.dump_all / jkchess.dump_uri_all ...");
     while (true) {
         usleep(100000);
         auto prop = get_property("jkchess.dump_uri");
@@ -726,6 +1008,11 @@ void dump_start(const char *game_data_dir) {
         if (dump_all_prop == "1") {
             set_property("jkchess.dump_all", "");
             dump_apk_asset_bundles();
+        }
+        auto enum_uri_prop = get_property("jkchess.dump_uri_all");
+        if (enum_uri_prop == "1") {
+            set_property("jkchess.dump_uri_all", "");
+            enumerate_apk_asset_uris(game_data_dir);
         }
     }
 }
